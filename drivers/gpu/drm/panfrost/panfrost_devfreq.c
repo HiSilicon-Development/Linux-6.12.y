@@ -31,6 +31,7 @@ static int panfrost_devfreq_target(struct device *dev, unsigned long *freq,
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
 	struct dev_pm_opp *opp;
+	unsigned long actual_freq;
 	int err;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
@@ -39,10 +40,25 @@ static int panfrost_devfreq_target(struct device *dev, unsigned long *freq,
 	dev_pm_opp_put(opp);
 
 	err = dev_pm_opp_set_rate(dev, *freq);
-	if (!err)
-		pfdev->pfdevfreq.current_frequency = *freq;
+	if (err)
+		return err;
 
-	return err;
+	/*
+	 * The CV200 clock provider has discrete selectors and the CCF API does
+	 * not guarantee that a provider error reaches the OPP caller.  Verify the
+	 * hardware rate before recording the transition, otherwise a failed
+	 * down-clock could leave the GPU at a high rate with a low OPP voltage.
+	 */
+	actual_freq = clk_get_rate(pfdev->clock);
+	if (actual_freq != *freq) {
+		DRM_DEV_ERROR(dev, "GPU rate transition not applied: requested %lu, actual %lu\n",
+			      *freq, actual_freq);
+		return -EIO;
+	}
+
+	pfdev->pfdevfreq.current_frequency = *freq;
+
+	return 0;
 }
 
 static void panfrost_devfreq_reset(struct panfrost_devfreq *pfdevfreq)

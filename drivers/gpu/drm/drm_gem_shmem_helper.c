@@ -686,18 +686,41 @@ static struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_shmem_
 	drm_WARN_ON(obj->dev, obj->import_attach);
 
 	ret = drm_gem_shmem_get_pages(shmem);
-	if (ret)
+	if (ret) {
+		dev_err(obj->dev->dev,
+			"DIAG sgt step1 get_pages err=%d size=0x%zx avail=%luKB comm=%s\n",
+			ret, obj->size, si_mem_available() * 4, current->comm);
 		return ERR_PTR(ret);
+	}
 
 	sgt = drm_gem_shmem_get_sg_table(shmem);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
+		dev_err(obj->dev->dev,
+			"DIAG sgt step2 get_sg_table err=%d npages=%zu avail=%luKB comm=%s\n",
+			ret, obj->size >> PAGE_SHIFT, si_mem_available() * 4, current->comm);
 		goto err_put_pages;
 	}
 	/* Map the pages for use by the h/w. */
 	ret = dma_map_sgtable(obj->dev->dev, sgt, DMA_BIDIRECTIONAL, 0);
-	if (ret)
+	if (ret) {
+		struct scatterlist *sg;
+		phys_addr_t first_pa = 0, last_pa = 0;
+		unsigned int i;
+
+		for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
+			if (!first_pa)
+				first_pa = sg_phys(sg);
+			last_pa = sg_phys(sg) + sg->length - 1;
+		}
+
+		dev_err(obj->dev->dev,
+			"DIAG sgt step3 dma_map_sgtable err=%d nents=%u size=0x%zx first_pa=%pa last_pa=%pa dma_mask=0x%llx avail=%luKB comm=%s\n",
+			ret, sgt->nents, obj->size, &first_pa, &last_pa,
+			(unsigned long long)dma_get_mask(obj->dev->dev),
+			si_mem_available() * 4, current->comm);
 		goto err_free_sgt;
+	}
 
 	shmem->sgt = sgt;
 

@@ -194,25 +194,319 @@ panfrost_enqueue_job(struct panfrost_device *pfdev, int slot,
 	return 1;
 }
 
-static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
+/*
+ * Diagnostic: print the words at a GPU virtual address as the job's own
+ * buffers see them.  Called from the submit path and from the job error
+ * interrupt (which runs in the threaded handler, before the reset work tears
+ * the mappings down), so the two prints can be compared to find out whether
+ * the chain changes between submission and execution.
+ */
+static void panfrost_diag_dump_va(struct panfrost_device *pfdev,
+				  struct panfrost_job *job, u64 va,
+				  const char *tag)
+{
+	unsigned int i;
+
+	for (i = 0; i < job->bo_count; i++) {
+		struct panfrost_gem_mapping *m = job->mappings[i];
+		struct panfrost_gem_object *bo = to_panfrost_bo(job->bos[i]);
+		struct iosys_map map;
+		u64 start, end, off;
+		u32 *w;
+
+		if (!m || bo->is_heap)
+			continue;
+
+		start = (u64)m->mmnode.start << PAGE_SHIFT;
+		end = start + ((u64)m->mmnode.size << PAGE_SHIFT);
+		if (va < start || va >= end)
+			continue;
+
+		off = va - start;
+		if (drm_gem_vmap_unlocked(&bo->base.base, &map))
+			return;
+		if (off + 32 <= bo->base.base.size) {
+			struct scatterlist *sgl;
+			unsigned int pg = off >> PAGE_SHIFT, k = 0;
+			u64 bo_phys = 0;
+			phys_addr_t as_phys;
+
+			w = (u32 *)((u8 *)map.vaddr + off);
+			for (sgl = bo->base.sgt ? bo->base.sgt->sgl : NULL; sgl;
+			     sgl = sg_next(sgl)) {
+				unsigned int n = sgl->length >> PAGE_SHIFT;
+
+				if (pg < k + n) {
+					bo_phys = sg_phys(sgl) +
+						  ((u64)(pg - k) << PAGE_SHIFT);
+					break;
+				}
+				k += n;
+			}
+			as_phys = job->mmu ?
+				  job->mmu->pgtbl_ops->iova_to_phys(job->mmu->pgtbl_ops, va) : 0;
+			dev_err(pfdev->dev,
+				"DIAG %s va=0x%llx BO[%u]+0x%llx active=%d madv=%u pages=%d: %08x %08x %08x %08x %08x %08x %08x %08x\n"
+				"DIAG %s pa: as=%pa bo=%pa %s (page granular)\n",
+				tag, va, i, off, m->active, bo->base.madv,
+				!!bo->base.pages, w[0], w[1], w[2], w[3],
+				w[4], w[5], w[6], w[7],
+				tag, &as_phys, &bo_phys,
+				(((u64)as_phys & PAGE_MASK) == (bo_phys & PAGE_MASK)) ?
+					"MATCH" : "MISMATCH");
+		}
+		drm_gem_vunmap_unlocked(&bo->base.base, &map);
+		return;
+	}
+
+	dev_err(pfdev->dev, "DIAG %s va=0x%llx is in none of the %u job BOs\n",
+		tag, va, job->bo_count);
+}
+
+/*
+ * Diagnostic: every address a job chain refers to must be mapped by one of the
+ * buffers the job carries.  Walk the chain words and report the ones that look
+ * like addresses and are covered by nothing - that is what the GPU fails to
+ * fetch.  Run in a working and in a failing configuration to compare.
+ */
+static void panfrost_diag_check_chain(struct panfrost_device *pfdev,
+				      struct panfrost_job *job, u64 jc)
+{
+	struct panfrost_gem_mapping *m;
+	struct panfrost_gem_object *bo;
+	struct iosys_map map;
+	u64 start, off;
+	const u32 *w;
+	unsigned int i, j, uncovered = 0;
+
+	for (i = 0; i < job->bo_count; i++) {
+		m = job->mappings[i];
+		bo = to_panfrost_bo(job->bos[i]);
+		if (!m || bo->is_heap)
+			continue;
+
+		start = (u64)m->mmnode.start << PAGE_SHIFT;
+		if (jc < start ||
+		    jc >= start + ((u64)m->mmnode.size << PAGE_SHIFT))
+			continue;
+
+		off = jc - start;
+		if (off + 128 > bo->base.base.size)
+			return;
+		if (drm_gem_vmap_unlocked(&bo->base.base, &map))
+			return;
+
+		w = (const u32 *)((const u8 *)map.vaddr + off);
+		for (j = 0; j < 32; j++) {
+			u64 va = le32_to_cpu(w[j]);
+			unsigned int k;
+
+			if (va < 0x1000 || va > 0xfffff000ULL)
+				continue;
+			for (k = 0; k < job->bo_count; k++) {
+				struct panfrost_gem_mapping *km = job->mappings[k];
+				u64 ks, ke;
+
+				if (!km)
+					continue;
+				ks = (u64)km->mmnode.start << PAGE_SHIFT;
+				ke = ks + ((u64)km->mmnode.size << PAGE_SHIFT);
+				if (va >= ks && va < ke)
+					break;
+			}
+			if (k == job->bo_count && uncovered++ < 6)
+				dev_err(pfdev->dev,
+					"DIAG chain UNCOVERED jc=0x%llx word[%u]=0x%08x nbo=%u pid=%d comm=%s\n",
+					jc, j, (u32)va, job->bo_count,
+					job->diag_pid, job->diag_comm);
+		}
+		drm_gem_vunmap_unlocked(&bo->base.base, &map);
+		if (uncovered)
+			dev_err(pfdev->dev,
+				"DIAG chain jc=0x%llx uncovered=%u (of 32 words)\n",
+				jc, uncovered);
+		return;
+	}
+
+	dev_err(pfdev->dev,
+		"DIAG chain jc=0x%llx not in any of the %u job buffers\n",
+		jc, job->bo_count);
+}
+
+/*
+ * Diagnostic: walk the job chain the way the hardware does - one 64 byte
+ * descriptor at a time, following the 64 bit next pointer in words 6:7 - and
+ * print every word.  Field layout for v5 (genxml), words are 32 bit:
+ *   0 exception status, 1 first incomplete task, 2:3 fault pointer,
+ *   4 is64b:1 type:7 barrier inv-cache suppress-prefetch index:16,
+ *   5 dependency1:16 dependency2:16, 6:7 next.
+ * The fragment job payload starts at word 8: bounds at 8:9, framebuffer
+ * pointer at 10:11, tile enable map at 12:13, row stride at 14.  A zero
+ * framebuffer pointer sends the GPU to VA 0.
+ */
+static void panfrost_diag_walk_chain(struct panfrost_device *pfdev,
+				     struct panfrost_job *job, u64 jc,
+				     const char *tag)
+{
+	unsigned int hop;
+
+	dev_err(pfdev->dev, "DIAG %s walk enter jc=0x%llx bo_count=%u\n",
+		tag, jc, job->bo_count);
+
+	for (hop = 0; hop < 4 && jc; hop++) {
+		struct panfrost_gem_mapping *m;
+		struct panfrost_gem_object *bo;
+		struct iosys_map map;
+		u64 start, off, next;
+		const u32 *w;
+		unsigned int i;
+
+		for (i = 0; i < job->bo_count; i++) {
+			m = job->mappings[i];
+			bo = to_panfrost_bo(job->bos[i]);
+			if (!m || bo->is_heap || !bo->base.base.size)
+				continue;
+			start = (u64)m->mmnode.start << PAGE_SHIFT;
+			if (jc >= start &&
+			    jc < start + ((u64)m->mmnode.size << PAGE_SHIFT))
+				break;
+		}
+		if (i == job->bo_count) {
+			dev_err(pfdev->dev,
+				"DIAG %s hop%u jc=0x%llx not in any job buffer\n",
+				tag, hop, jc);
+			return;
+		}
+		off = jc - start;
+		if (off + 64 > bo->base.base.size) {
+			dev_err(pfdev->dev,
+				"DIAG %s hop%u jc=0x%llx BO[%u]+0x%llx past end size=0x%zx\n",
+				tag, hop, jc, i, off, bo->base.base.size);
+			return;
+		}
+		if (drm_gem_vmap_unlocked(&bo->base.base, &map)) {
+			dev_err(pfdev->dev,
+				"DIAG %s hop%u jc=0x%llx BO[%u]+0x%llx vmap failed\n",
+				tag, hop, jc, i, off);
+			return;
+		}
+
+		w = (const u32 *)((const u8 *)map.vaddr + off);
+		dev_err(pfdev->dev,
+			"DIAG %s hop%u va=0x%llx BO[%u]+0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x\n"
+			"DIAG %s hop%u payload: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			tag, hop, jc, i, off,
+			le32_to_cpu(w[0]), le32_to_cpu(w[1]),
+			le32_to_cpu(w[2]), le32_to_cpu(w[3]),
+			le32_to_cpu(w[4]), le32_to_cpu(w[5]),
+			le32_to_cpu(w[6]), le32_to_cpu(w[7]),
+			tag, hop,
+			le32_to_cpu(w[8]), le32_to_cpu(w[9]),
+			le32_to_cpu(w[10]), le32_to_cpu(w[11]),
+			le32_to_cpu(w[12]), le32_to_cpu(w[13]),
+			le32_to_cpu(w[14]), le32_to_cpu(w[15]));
+
+		next = (u64)le32_to_cpu(w[6]) |
+		       ((u64)le32_to_cpu(w[7]) << 32);
+		drm_gem_vunmap_unlocked(&bo->base.base, &map);
+		if (next == jc)
+			return;
+		jc = next;
+	}
+}
+
+static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
 {
 	struct panfrost_device *pfdev = job->pfdev;
 	unsigned int subslot;
 	u32 cfg;
 	u64 jc_head = job->jc;
 	int ret;
+	unsigned int i;
 
 	panfrost_devfreq_record_busy(&pfdev->pfdevfreq);
 
+	/*
+	 * The job chain must live inside one of the buffers the job maps.  A jc
+	 * that is covered by nothing makes the GPU fault as soon as it fetches
+	 * the chain (head == tail, DATA_INVALID_FAULT) and, on this CV200
+	 * integration, the address space then sticks until the whole GPU is
+	 * reset.  Refuse the job instead of wedging the device, and say which
+	 * address was not covered so the caller can be identified.
+	 */
+	for (i = 0; i < job->bo_count; i++) {
+		struct panfrost_gem_mapping *m = job->mappings[i];
+		u64 start, end;
+
+		if (!m)
+			continue;
+		start = (u64)m->mmnode.start << PAGE_SHIFT;
+		end = start + ((u64)m->mmnode.size << PAGE_SHIFT);
+		if (jc_head >= start && jc_head < end)
+			break;
+	}
+
+	if (i == job->bo_count) {
+		dev_err(pfdev->dev,
+			"job chain 0x%llx is outside the %u buffers of this job (js=%d), refusing to submit\n",
+			jc_head, job->bo_count, js);
+		panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+		return -EINVAL;
+	}
+
 	ret = pm_runtime_get_sync(pfdev->dev);
-	if (ret < 0)
-		return;
+	if (ret < 0) {
+		pm_runtime_put_noidle(pfdev->dev);
+		panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+		return ret;
+	}
 
 	if (WARN_ON(job_read(pfdev, JS_COMMAND_NEXT(js)))) {
-		return;
+		pm_runtime_mark_last_busy(pfdev->dev);
+		pm_runtime_put_autosuspend(pfdev->dev);
+		panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+		return -EBUSY;
 	}
 
 	cfg = panfrost_mmu_as_get(pfdev, job->mmu);
+
+	/*
+	 * Diagnostic: the userspace must tell the GPU where the tiler heap is.
+	 * Print the address the kernel assigned to the heap BO next to the
+	 * contents of the job chain, so a heap address of zero in the chain can
+	 * be attributed to the kernel or to the client.
+	 */
+	{
+		static unsigned int diag_count;
+		unsigned int i;
+
+		for (i = 0; i < job->bo_count; i++) {
+			struct panfrost_gem_object *bo =
+				to_panfrost_bo(job->bos[i]);
+
+			if (!bo->is_heap)
+				continue;
+			dev_info(pfdev->dev,
+				 "DIAG heap job: js=%d jc=0x%llx heap_va=0x%llx heap_size=%zu map_active=%d\n",
+				 js, jc_head,
+				 job->mappings[i] ?
+					(unsigned long long)(job->mappings[i]->mmnode.start << PAGE_SHIFT) : 0ULL,
+				 bo->base.base.size,
+				 job->mappings[i] ? job->mappings[i]->active : -1);
+			break;
+		}
+
+		if (diag_count < 400) {
+			dev_info(pfdev->dev, "DIAG submit js=%d jc=0x%llx comm=%s\n",
+				 js, jc_head, current->comm);
+			panfrost_diag_dump_va(pfdev, job, jc_head, "chain-submit");
+			panfrost_diag_check_chain(pfdev, job, jc_head);
+			if (diag_count < 120)
+				panfrost_diag_walk_chain(pfdev, job, jc_head,
+							 "submit");
+			diag_count++;
+		}
+	}
 
 	job_write(pfdev, JS_HEAD_NEXT_LO(js), lower_32_bits(jc_head));
 	job_write(pfdev, JS_HEAD_NEXT_HI(js), upper_32_bits(jc_head));
@@ -233,6 +527,16 @@ static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
 		cfg |= JS_CONFIG_START_MMU;
 
 	job_write(pfdev, JS_CONFIG_NEXT(js), cfg);
+
+	{
+		static unsigned int diag_cfg;
+
+		if (diag_cfg++ < 300)
+			dev_info(pfdev->dev,
+				 "DIAG JSCFG js=%d cfg=0x%x reqs=0x%x jc=0x%llx pid=%d comm=%s\n",
+				 js, cfg, job->requirements, jc_head,
+				 job->diag_pid, job->diag_comm);
+	}
 
 	if (panfrost_has_hw_feature(pfdev, HW_FEATURE_FLUSH_REDUCTION))
 		job_write(pfdev, JS_FLUSH_ID_NEXT(js), job->flush_id);
@@ -256,6 +560,8 @@ static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
 			job, js, subslot, jc_head, cfg & 0xf);
 	}
 	spin_unlock(&pfdev->js->job_lock);
+
+	return 0;
 }
 
 static int panfrost_acquire_object_fences(struct drm_gem_object **bos,
@@ -377,6 +683,7 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
 	struct panfrost_device *pfdev = job->pfdev;
 	int slot = panfrost_job_get_slot(job);
 	struct dma_fence *fence = NULL;
+	int ret;
 
 	if (unlikely(job->base.s_fence->finished.error))
 		return NULL;
@@ -395,7 +702,13 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
 		dma_fence_put(job->done_fence);
 	job->done_fence = dma_fence_get(fence);
 
-	panfrost_job_hw_submit(job, slot);
+	ret = panfrost_job_hw_submit(job, slot);
+	if (ret) {
+		/* Keep scheduler progress and the userspace fence intact if the
+		 * device cannot be resumed or the slot is unexpectedly occupied. */
+		dma_fence_set_error(fence, ret);
+		dma_fence_signal(fence);
+	}
 
 	return fence;
 }
@@ -441,6 +754,33 @@ static void panfrost_job_handle_err(struct panfrost_device *pfdev,
 			js, exception_name,
 			job_read(pfdev, JS_HEAD_LO(js)),
 			job_read(pfdev, JS_TAIL_LO(js)));
+	}
+
+	/*
+	 * Diagnostic: capture the chain the GPU was executing before the reset
+	 * work runs, while the job buffers are still mapped.
+	 */
+	if (panfrost_exception_is_fault(js_status)) {
+		static unsigned int fault_diag;
+
+		if (fault_diag++ < 400) {
+			u64 head = (u64)job_read(pfdev, JS_HEAD_LO(js)) |
+				  ((u64)job_read(pfdev, JS_HEAD_HI(js)) << 32);
+
+			dev_err(pfdev->dev,
+				"DIAG fault js=%d jc=0x%llx head=0x%llx tail=0x%llx nbos=%u as=%d pid=%d comm=%s\n",
+				js, job->jc, head,
+				(u64)job_read(pfdev, JS_TAIL_LO(js)) |
+				((u64)job_read(pfdev, JS_TAIL_HI(js)) << 32),
+				job->bo_count, job->mmu ? job->mmu->as : -1,
+				job->diag_pid, job->diag_comm);
+			panfrost_diag_dump_va(pfdev, job, job->jc, "chain-fault");
+			panfrost_diag_dump_va(pfdev, job, head, "head-fault");
+			panfrost_diag_check_chain(pfdev, job, job->jc);
+			if (fault_diag <= 120)
+				panfrost_diag_walk_chain(pfdev, job, job->jc,
+							 "fault");
+		}
 	}
 
 	if (js_status == DRM_PANFROST_EXCEPTION_STOPPED) {
@@ -627,7 +967,7 @@ static u32 panfrost_active_slots(struct panfrost_device *pfdev,
 	return js_state & *js_state_mask;
 }
 
-static void
+static int
 panfrost_reset(struct panfrost_device *pfdev,
 	       struct drm_sched_job *bad)
 {
@@ -637,7 +977,7 @@ panfrost_reset(struct panfrost_device *pfdev,
 	int ret;
 
 	if (!atomic_read(&pfdev->reset.pending))
-		return;
+		return 0;
 
 	/* Stop the schedulers.
 	 *
@@ -703,7 +1043,13 @@ panfrost_reset(struct panfrost_device *pfdev,
 	spin_unlock(&pfdev->js->job_lock);
 
 	/* Proceed with reset now. */
-	panfrost_device_reset(pfdev);
+	ret = panfrost_device_reset(pfdev);
+	if (ret) {
+		dev_err(pfdev->dev,
+			"GPU reset failed: %d; leaving schedulers stopped\n", ret);
+		dma_fence_end_signalling(cookie);
+		return ret;
+	}
 
 	/* panfrost_device_reset() unmasks job interrupts, but we want to
 	 * keep them masked a bit longer.
@@ -735,6 +1081,7 @@ panfrost_reset(struct panfrost_device *pfdev,
 		  GENMASK(NUM_JOB_SLOTS - 1, 0));
 
 	dma_fence_end_signalling(cookie);
+	return 0;
 }
 
 static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
@@ -778,7 +1125,8 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
 	panfrost_core_dump(job);
 
 	atomic_set(&pfdev->reset.pending, 1);
-	panfrost_reset(pfdev, sched_job);
+	if (panfrost_reset(pfdev, sched_job))
+		return DRM_GPU_SCHED_STAT_ENODEV;
 
 	return DRM_GPU_SCHED_STAT_NOMINAL;
 }
@@ -788,7 +1136,9 @@ static void panfrost_reset_work(struct work_struct *work)
 	struct panfrost_device *pfdev;
 
 	pfdev = container_of(work, struct panfrost_device, reset.work);
-	panfrost_reset(pfdev, NULL);
+	if (panfrost_reset(pfdev, NULL))
+		dev_err(pfdev->dev,
+			"GPU reset work failed; scheduler remains stopped\n");
 }
 
 static const struct drm_sched_backend_ops panfrost_sched_ops = {
@@ -883,6 +1233,9 @@ int panfrost_job_init(struct panfrost_device *pfdev)
 	}
 
 	panfrost_job_enable_interrupts(pfdev);
+
+	dev_err(pfdev->dev,
+		"DIAG panfrost_job_init marker: chain walker build loaded\n");
 
 	return 0;
 

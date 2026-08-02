@@ -5,6 +5,7 @@
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
+#include <linux/pagemap.h>
 
 #include <drm/panfrost_drm.h>
 #include "panfrost_device.h"
@@ -149,11 +150,17 @@ int panfrost_gem_open(struct drm_gem_object *obj, struct drm_file *file_priv)
 	if (ret)
 		goto err;
 
-	if (!bo->is_heap) {
-		ret = panfrost_mmu_map(mapping);
-		if (ret)
-			goto err;
-	}
+	/*
+	 * Diagnostic/experiment: map the tiler heap eagerly instead of relying
+	 * on the fault driven lazy mapping.  On this CV200 integration the AS
+	 * command that would install the faulted heap page never completes
+	 * (AS_ACTIVE stays set, wait_ready() times out and the driver resets),
+	 * so every client tiler job ends up in a fault/reset loop.  Mapping the
+	 * heap up front keeps the client jobs off that path entirely.
+	 */
+	ret = panfrost_mmu_map(mapping);
+	if (ret)
+		goto err;
 
 	mutex_lock(&bo->mappings.lock);
 	WARN_ON(bo->base.madv != PANFROST_MADV_WILLNEED);
@@ -267,8 +274,10 @@ struct drm_gem_object *panfrost_gem_create_object(struct drm_device *dev, size_t
 struct panfrost_gem_object *
 panfrost_gem_create(struct drm_device *dev, size_t size, u32 flags)
 {
+	struct panfrost_device *pfdev = dev->dev_private;
 	struct drm_gem_shmem_object *shmem;
 	struct panfrost_gem_object *bo;
+	gfp_t mask;
 
 	/* Round up heap allocations to 2MB to keep fault handling simple */
 	if (flags & PANFROST_BO_HEAP)
@@ -277,6 +286,24 @@ panfrost_gem_create(struct drm_device *dev, size_t size, u32 flags)
 	shmem = drm_gem_shmem_create(dev, size);
 	if (IS_ERR(shmem))
 		return ERR_CAST(shmem);
+
+	if (pfdev->comp->needs_dma_zone && dma_addressing_limited(pfdev->dev)) {
+		mask = mapping_gfp_mask(shmem->base.filp->f_mapping);
+		mask = (mask & ~GFP_ZONEMASK) | GFP_DMA;
+		mapping_set_gfp_mask(shmem->base.filp->f_mapping, mask);
+		dev_info(pfdev->dev,
+			 "DIAG GFP_DMA forced: mask=0x%x size=0x%zx comm=%s\n",
+			 mask, size, current->comm);
+	} else {
+		dev_info(pfdev->dev,
+			 "DIAG no GFP_DMA: needs_dma=%d limited=%d dma_mask=0x%llx req_mask=0x%llx mask=0x%x size=0x%zx comm=%s\n",
+			 pfdev->comp->needs_dma_zone,
+			 dma_addressing_limited(pfdev->dev),
+			 (unsigned long long)dma_get_mask(pfdev->dev),
+			 (unsigned long long)dma_get_required_mask(pfdev->dev),
+			 mapping_gfp_mask(shmem->base.filp->f_mapping), size,
+			 current->comm);
+	}
 
 	bo = to_panfrost_bo(&shmem->base);
 	bo->noexec = !!(flags & PANFROST_BO_NOEXEC);

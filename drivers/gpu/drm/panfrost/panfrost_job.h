@@ -37,6 +37,11 @@ struct panfrost_job {
 	bool is_profiled;
 	ktime_t start_time;
 	u64 start_cycles;
+
+	/* Diagnostic: who asked for this job.  The submit ioctl runs in the
+	 * client's context, the error path only in the interrupt thread. */
+	char diag_comm[TASK_COMM_LEN];
+	pid_t diag_pid;
 };
 
 int panfrost_job_init(struct panfrost_device *pfdev);

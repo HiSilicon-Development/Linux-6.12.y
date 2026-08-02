@@ -92,6 +92,18 @@ struct panfrost_compatible {
 
 	/* Vendor implementation quirks callback */
 	void (*vendor_quirk)(struct panfrost_device *pfdev);
+	/* Native allocations need to stay in the device DMA zone. */
+	bool needs_dma_zone;
+	/*
+	 * The GPU consumes page-table physical addresses directly, so the page
+	 * tables must live in the zone the device can walk even when buffers
+	 * themselves may be anywhere in RAM.
+	 */
+	bool pgtbl_dma_zone;
+	/* Runtime power cycling is not reliable on this integration. */
+	bool runtime_pm_forbidden;
+	/* The integration needs extra time to report reset completion. */
+	bool slow_reset;
 
 	/* Allowed PM features */
 	u8 pm_features;
@@ -207,7 +219,7 @@ int panfrost_unstable_ioctl_check(void);
 
 int panfrost_device_init(struct panfrost_device *pfdev);
 void panfrost_device_fini(struct panfrost_device *pfdev);
-void panfrost_device_reset(struct panfrost_device *pfdev);
+int panfrost_device_reset(struct panfrost_device *pfdev);
 
 extern const struct dev_pm_ops panfrost_pm_ops;
 

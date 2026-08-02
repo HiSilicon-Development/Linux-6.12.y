@@ -15,12 +15,22 @@
 #include "panfrost_gem.h"
 #include "panfrost_mmu.h"
 
+static bool panfrost_purge_disable;
+module_param_named(purge_disable, panfrost_purge_disable, bool, 0644);
+MODULE_PARM_DESC(purge_disable,
+		 "Diagnostic: never purge Panfrost shmem BOs (default 0)");
+
+#define panfrost_purge_allowed() (!READ_ONCE(panfrost_purge_disable))
+
 static unsigned long
 panfrost_gem_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)
 {
 	struct panfrost_device *pfdev = shrinker->private_data;
 	struct drm_gem_shmem_object *shmem;
 	unsigned long count = 0;
+
+	if (!panfrost_purge_allowed())
+		return 0;
 
 	if (!mutex_trylock(&pfdev->shrinker_lock))
 		return 0;
@@ -40,6 +50,9 @@ static bool panfrost_gem_purge(struct drm_gem_object *obj)
 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
 	struct panfrost_gem_object *bo = to_panfrost_bo(obj);
 	bool ret = false;
+
+	if (!panfrost_purge_allowed())
+		return false;
 
 	if (atomic_read(&bo->gpu_usecount))
 		return false;

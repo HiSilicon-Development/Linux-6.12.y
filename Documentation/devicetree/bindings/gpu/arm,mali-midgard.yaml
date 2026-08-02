@@ -27,6 +27,9 @@ properties:
               - allwinner,sun50i-h6-mali
           - const: arm,mali-t720
       - items:
+          - const: hisilicon,hi3798cv200-mali
+          - const: arm,mali-t720
+      - items:
           - enum:
               - amlogic,meson-gxm-mali
               - realtek,rtd1295-mali

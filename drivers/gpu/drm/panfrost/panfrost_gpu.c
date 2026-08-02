@@ -19,6 +19,9 @@
 #include "panfrost_perfcnt.h"
 #include "panfrost_regs.h"
 
+#define GPU_RESET_TIMEOUT_US	10000
+#define GPU_SLOW_RESET_TIMEOUT_US 500000
+
 static irqreturn_t panfrost_gpu_irq_handler(int irq, void *data)
 {
 	struct panfrost_device *pfdev = data;
@@ -59,6 +62,8 @@ static irqreturn_t panfrost_gpu_irq_handler(int irq, void *data)
 
 int panfrost_gpu_soft_reset(struct panfrost_device *pfdev)
 {
+	unsigned int timeout_us = pfdev->comp->slow_reset ?
+		GPU_SLOW_RESET_TIMEOUT_US : GPU_RESET_TIMEOUT_US;
 	int ret;
 	u32 val;
 
@@ -69,14 +74,15 @@ int panfrost_gpu_soft_reset(struct panfrost_device *pfdev)
 
 	gpu_write(pfdev, GPU_CMD, GPU_CMD_SOFT_RESET);
 	ret = readl_relaxed_poll_timeout(pfdev->iomem + GPU_INT_RAWSTAT,
-		val, val & GPU_IRQ_RESET_COMPLETED, 10, 10000);
+		val, val & GPU_IRQ_RESET_COMPLETED, 10, timeout_us);
 
 	if (ret) {
 		dev_err(pfdev->dev, "gpu soft reset timed out, attempting hard reset\n");
 
 		gpu_write(pfdev, GPU_CMD, GPU_CMD_HARD_RESET);
 		ret = readl_relaxed_poll_timeout(pfdev->iomem + GPU_INT_RAWSTAT, val,
-						 val & GPU_IRQ_RESET_COMPLETED, 100, 10000);
+						 val & GPU_IRQ_RESET_COMPLETED, 100,
+						 timeout_us);
 		if (ret) {
 			dev_err(pfdev->dev, "gpu hard reset timed out\n");
 			return ret;
@@ -402,9 +408,9 @@ static u64 panfrost_get_core_mask(struct panfrost_device *pfdev)
 	return core_mask;
 }
 
-void panfrost_gpu_power_on(struct panfrost_device *pfdev)
+int panfrost_gpu_power_on(struct panfrost_device *pfdev)
 {
-	int ret;
+	int ret, err = 0;
 	u32 val;
 	u64 core_mask;
 
@@ -415,46 +421,62 @@ void panfrost_gpu_power_on(struct panfrost_device *pfdev)
 	ret = readl_relaxed_poll_timeout(pfdev->iomem + L2_READY_LO,
 		val, val == (pfdev->features.l2_present & core_mask),
 		10, 20000);
-	if (ret)
+	if (ret) {
+		err = ret;
 		dev_err(pfdev->dev, "error powering up gpu L2");
+	}
 
 	gpu_write(pfdev, SHADER_PWRON_LO,
 		  pfdev->features.shader_present & core_mask);
 	ret = readl_relaxed_poll_timeout(pfdev->iomem + SHADER_READY_LO,
 		val, val == (pfdev->features.shader_present & core_mask),
 		10, 20000);
-	if (ret)
+	if (ret) {
+		err = err ?: ret;
 		dev_err(pfdev->dev, "error powering up gpu shader");
+	}
 
 	gpu_write(pfdev, TILER_PWRON_LO, pfdev->features.tiler_present);
 	ret = readl_relaxed_poll_timeout(pfdev->iomem + TILER_READY_LO,
 		val, val == pfdev->features.tiler_present, 10, 1000);
-	if (ret)
+	if (ret) {
+		err = err ?: ret;
 		dev_err(pfdev->dev, "error powering up gpu tiler");
+	}
+
+	return err;
 }
 
-void panfrost_gpu_power_off(struct panfrost_device *pfdev)
+int panfrost_gpu_power_off(struct panfrost_device *pfdev)
 {
-	int ret;
+	int ret, err = 0;
 	u32 val;
 
 	gpu_write(pfdev, SHADER_PWROFF_LO, pfdev->features.shader_present);
 	ret = readl_relaxed_poll_timeout(pfdev->iomem + SHADER_PWRTRANS_LO,
 					 val, !val, 1, 2000);
-	if (ret)
+	if (ret) {
+		err = ret;
 		dev_err(pfdev->dev, "shader power transition timeout");
+	}
 
 	gpu_write(pfdev, TILER_PWROFF_LO, pfdev->features.tiler_present);
 	ret = readl_relaxed_poll_timeout(pfdev->iomem + TILER_PWRTRANS_LO,
 					 val, !val, 1, 2000);
-	if (ret)
+	if (ret) {
+		err = err ?: ret;
 		dev_err(pfdev->dev, "tiler power transition timeout");
+	}
 
 	gpu_write(pfdev, L2_PWROFF_LO, pfdev->features.l2_present);
 	ret = readl_poll_timeout(pfdev->iomem + L2_PWRTRANS_LO,
 				 val, !val, 0, 2000);
-	if (ret)
+	if (ret) {
+		err = err ?: ret;
 		dev_err(pfdev->dev, "l2 power transition timeout");
+	}
+
+	return err;
 }
 
 void panfrost_gpu_suspend_irq(struct panfrost_device *pfdev)
@@ -493,7 +515,9 @@ int panfrost_gpu_init(struct panfrost_device *pfdev)
 		return err;
 	}
 
-	panfrost_gpu_power_on(pfdev);
+	err = panfrost_gpu_power_on(pfdev);
+	if (err)
+		return err;
 
 	return 0;
 }

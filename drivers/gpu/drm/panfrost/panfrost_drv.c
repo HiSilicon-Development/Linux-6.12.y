@@ -285,6 +285,40 @@ static int panfrost_ioctl_submit(struct drm_device *dev, void *data,
 	if (ret)
 		goto out_cleanup_job;
 
+	/*
+	 * Diagnostic: record who submitted, then print the whole request -
+	 * requirements, chain address and every mapped buffer - so the ioctl
+	 * stream of two userspace drivers can be compared field by field.
+	 */
+	job->diag_pid = task_tgid_nr(current);
+	strscpy(job->diag_comm, current->comm, sizeof(job->diag_comm));
+
+	{
+		static unsigned int diag_submits;
+		unsigned int i;
+
+		if (diag_submits++ < 300) {
+			dev_info(pfdev->dev,
+				 "DIAG SUBMIT slot=%d pid=%d comm=%s jc=0x%llx reqs=0x%x nbo=%u\n",
+				 slot, job->diag_pid, job->diag_comm, job->jc,
+				 job->requirements, job->bo_count);
+			for (i = 0; i < job->bo_count && i < 8; i++) {
+				struct panfrost_gem_object *bo =
+					to_panfrost_bo(job->bos[i]);
+
+				dev_info(pfdev->dev,
+					 "DIAG SUBMIT   bo[%u] va=0x%llx size=0x%zx heap=%d madv=%u purgeable=%d active=%d\n",
+					 i,
+					 job->mappings[i] ?
+					   (unsigned long long)(job->mappings[i]->mmnode.start << PAGE_SHIFT) : 0ULL,
+					 bo->base.base.size, bo->is_heap,
+					 bo->base.madv,
+					 drm_gem_shmem_is_purgeable(&bo->base),
+					 job->mappings[i] ? job->mappings[i]->active : -1);
+			}
+		}
+	}
+
 	ret = panfrost_job_push(job);
 	if (ret)
 		goto out_cleanup_job;
@@ -389,6 +423,10 @@ static int panfrost_ioctl_get_bo_offset(struct drm_device *dev, void *data,
 		return -EINVAL;
 
 	args->offset = mapping->mmnode.start << PAGE_SHIFT;
+	dev_info_ratelimited(dev->dev,
+			     "DIAG get_bo_offset: handle=%u heap=%d noexec=%d -> va=0x%llx active=%d\n",
+			     args->handle, bo->is_heap, bo->noexec,
+			     (unsigned long long)args->offset, mapping->active);
 	panfrost_gem_mapping_put(mapping);
 	return 0;
 }
@@ -419,6 +457,12 @@ static int panfrost_ioctl_madvise(struct drm_device *dev, void *data,
 	mutex_lock(&bo->mappings.lock);
 	if (args->madv == PANFROST_MADV_DONTNEED) {
 		struct panfrost_gem_mapping *first;
+
+		/* An imported or not-yet-mapped BO has no address-space mapping. */
+		if (list_empty(&bo->mappings.list)) {
+			ret = -EINVAL;
+			goto out_unlock_mappings;
+		}
 
 		first = list_first_entry(&bo->mappings.list,
 					 struct panfrost_gem_mapping,
@@ -624,6 +668,12 @@ static int panfrost_probe(struct platform_device *pdev)
 	if (!pfdev->comp)
 		return -ENODEV;
 
+	/*
+	 * The GPU node carries no dma-coherent property, so a non-snooping GPU
+	 * must be driven through the non-coherent path: IOMMU walks uncached
+	 * and buffer mappings write-combining.  Forcing the coherent path here
+	 * maps buffers write-back and the GPU then reads stale lines.
+	 */
 	pfdev->coherent = device_get_dma_attr(&pdev->dev) == DEV_DMA_COHERENT;
 
 	/* Allocate and initialize the DRM device. */
@@ -647,8 +697,13 @@ static int panfrost_probe(struct platform_device *pdev)
 	pm_runtime_set_active(pfdev->dev);
 	pm_runtime_mark_last_busy(pfdev->dev);
 	pm_runtime_enable(pfdev->dev);
-	pm_runtime_set_autosuspend_delay(pfdev->dev, 50); /* ~3 frames */
-	pm_runtime_use_autosuspend(pfdev->dev);
+	if (pfdev->comp->runtime_pm_forbidden) {
+		pm_runtime_forbid(pfdev->dev);
+		dev_info(pfdev->dev, "runtime power management disabled\n");
+	} else {
+		pm_runtime_set_autosuspend_delay(pfdev->dev, 50); /* ~3 frames */
+		pm_runtime_use_autosuspend(pfdev->dev);
+	}
 
 	/*
 	 * Register the DRM device with the core and the connectors with
@@ -667,6 +722,8 @@ static int panfrost_probe(struct platform_device *pdev)
 err_out2:
 	drm_dev_unregister(ddev);
 err_out1:
+	if (pfdev->comp->runtime_pm_forbidden)
+		pm_runtime_allow(pfdev->dev);
 	pm_runtime_disable(pfdev->dev);
 	panfrost_device_fini(pfdev);
 	pm_runtime_set_suspended(pfdev->dev);
@@ -684,6 +741,8 @@ static void panfrost_remove(struct platform_device *pdev)
 	panfrost_gem_shrinker_cleanup(ddev);
 
 	pm_runtime_get_sync(pfdev->dev);
+	if (pfdev->comp->runtime_pm_forbidden)
+		pm_runtime_allow(pfdev->dev);
 	pm_runtime_disable(pfdev->dev);
 	panfrost_device_fini(pfdev);
 	pm_runtime_set_suspended(pfdev->dev);
@@ -744,6 +803,25 @@ static const struct panfrost_compatible amlogic_data = {
 	.vendor_quirk = panfrost_gpu_amlogic_quirk,
 };
 
+static const struct panfrost_compatible hisilicon_hi3798cv200_data = {
+	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
+	.supply_names = default_supplies,
+	.num_pm_domains = 1,
+	/*
+	 * Page tables have to stay in the low zone because the GPU walks their
+	 * physical addresses directly and cannot reach above the block's window.
+	 * Buffers themselves are reached through the GPU's own MMU, so they may
+	 * live anywhere the device aperture allows; keeping them out of the
+	 * small low zone is what lets several GL processes coexist on this
+	 * 2 GiB board, each with its own 128 MiB tiler heap.
+	 */
+	.pgtbl_dma_zone = true,
+	.runtime_pm_forbidden = true,
+	.slow_reset = true,
+};
+
+
+
 /*
  * The old data with two power supplies for MT8183 is here only to
  * keep retro-compatibility with older devicetrees, as DVFS will
@@ -801,6 +879,8 @@ static const struct panfrost_compatible mediatek_mt8192_data = {
 
 static const struct of_device_id dt_match[] = {
 	/* Set first to probe before the generic compatibles */
+	{ .compatible = "hisilicon,hi3798cv200-mali",
+	  .data = &hisilicon_hi3798cv200_data, },
 	{ .compatible = "amlogic,meson-gxm-mali",
 	  .data = &amlogic_data, },
 	{ .compatible = "amlogic,meson-g12a-mali",

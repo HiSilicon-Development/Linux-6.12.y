@@ -185,6 +185,10 @@ void panfrost_core_dump(struct panfrost_job *job)
 
 	panfrost_core_dump_registers(&iter, pfdev, as_nr, slot);
 
+	dev_err(pfdev->dev,
+		"Panfrost Dump: job=%p jc=0x%llx slot=%d as=%d reqs=0x%x nbos=%u\n",
+		job, job->jc, slot, as_nr, job->requirements, job->bo_count);
+
 	/* Reserve space for the bomap */
 	if (job->bo_count) {
 		bomap_start = bomap = iter.data;
@@ -203,11 +207,23 @@ void panfrost_core_dump(struct panfrost_job *job)
 		bo = to_panfrost_bo(job->bos[i]);
 		mapping = job->mappings[i];
 
-		if (!bo->base.sgt) {
-			dev_err(pfdev->dev, "Panfrost Dump: BO has no sgt, cannot dump\n");
-			iter.hdr->bomap.valid = 0;
-			goto dump_header;
-		}
+		/*
+		 * Diagnostic: the job that faults may reference a BO that has no
+		 * page table at all (purged, never mapped, or an import that lost
+		 * its sgt).  Record every property we can read so the failing BO
+		 * can be identified from the log alone.
+		 */
+		dev_err(pfdev->dev,
+			"Panfrost Dump: BO[%u] size=%zu noexec=%d heap=%d madv=%d purgeable=%d pages=%d sgt=%p import=%p mapping=%p active=%d iova=0x%llx usecount=%d map_as=%d job_as=%d\n",
+			i, bo->base.base.size, bo->noexec, bo->is_heap,
+			bo->base.madv, drm_gem_shmem_is_purgeable(&bo->base),
+			!!bo->base.pages, bo->base.sgt,
+			bo->base.base.import_attach, mapping,
+			mapping ? mapping->active : false,
+			mapping ?
+				(unsigned long long)mapping->mmnode.start << PAGE_SHIFT : 0ULL,
+			atomic_read(&bo->gpu_usecount),
+			mapping ? mapping->mmu->as : -1, as_nr);
 
 		ret = drm_gem_vmap_unlocked(&bo->base.base, &map);
 		if (ret) {
@@ -216,25 +232,67 @@ void panfrost_core_dump(struct panfrost_job *job)
 			goto dump_header;
 		}
 
-		WARN_ON(!mapping->active);
+		if (mapping)
+			WARN_ON(!mapping->active);
 
 		iter.hdr->bomap.data[0] = bomap - bomap_start;
 
-		for_each_sgtable_page(bo->base.sgt, &page_iter, 0)
-			*bomap++ = page_to_phys(sg_page_iter_page(&page_iter));
-
-		iter.hdr->bomap.iova = mapping->mmnode.start << PAGE_SHIFT;
+		if (bo->base.sgt) {
+			for_each_sgtable_page(bo->base.sgt, &page_iter, 0)
+				*bomap++ = page_to_phys(sg_page_iter_page(&page_iter));
+			iter.hdr->bomap.iova = mapping->mmnode.start << PAGE_SHIFT;
+			iter.hdr->bomap.valid = 1;
+		} else {
+			/* Keep the contents: they show whether the GPU executed
+			 * zeroed, stale or valid descriptors. */
+			dev_err(pfdev->dev,
+				"Panfrost Dump: BO[%u] has no sgt, dumping contents without a bomap\n",
+				i);
+			iter.hdr->bomap.valid = 0;
+		}
 
 		vaddr = map.vaddr;
 		memcpy(iter.data, vaddr, bo->base.base.size);
 
-		drm_gem_vunmap_unlocked(&bo->base.base, &map);
+		/*
+		 * Diagnostic: show the raw words the job chain starts with.  A
+		 * descriptor field that holds a zero address is the difference
+		 * between "the userspace built a bad chain" and "the GPU read
+		 * memory we never invalidated".
+		 */
+		if (mapping &&
+		    job->jc >= (u64)(mapping->mmnode.start << PAGE_SHIFT) &&
+		    job->jc < (u64)((mapping->mmnode.start + mapping->mmnode.size) << PAGE_SHIFT)) {
+			u64 off = job->jc -
+				  (u64)(mapping->mmnode.start << PAGE_SHIFT);
 
-		iter.hdr->bomap.valid = 1;
+			if (off + 32 > bo->base.base.size) {
+				dev_err(pfdev->dev,
+					"DIAG jc=0x%llx in BO[%u] offset 0x%llx beyond BO size 0x%zx\n",
+					job->jc, i, off, bo->base.base.size);
+			} else {
+				const u32 *words =
+					(const u32 *)((const char *)vaddr + off);
+
+				dev_err(pfdev->dev,
+					"DIAG jc=0x%llx lives in BO[%u] off=0x%llx active=%d: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+					job->jc, i, off, mapping->active,
+					words[0], words[1], words[2], words[3],
+					words[4], words[5], words[6], words[7]);
+			}
+		}
+
+		drm_gem_vunmap_unlocked(&bo->base.base, &map);
 
 dump_header:	panfrost_core_dump_header(&iter, PANFROSTDUMP_BUF_BO, iter.data +
 					  bo->base.base.size);
 	}
+
+	if (i == job->bo_count)
+		dev_err(pfdev->dev,
+			"DIAG jc=0x%llx is in none of the %u job BOs\n",
+			job->jc, job->bo_count);
+
 	panfrost_core_dump_header(&iter, PANFROSTDUMP_BUF_TRAILER, iter.data);
 
 	dev_coredumpv(pfdev->dev, iter.start, iter.data - iter.start, GFP_KERNEL);

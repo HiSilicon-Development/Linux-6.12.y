@@ -12,6 +12,7 @@
 #include <linux/iopoll.h>
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
+#include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/shmem_fs.h>
@@ -121,12 +122,35 @@ static int mmu_hw_do_operation(struct panfrost_device *pfdev,
 	return ret;
 }
 
+static bool mali_vendor_regs;
+module_param(mali_vendor_regs, bool, 0644);
+MODULE_PARM_DESC(mali_vendor_regs,
+		 "program the AS registers the vendor LPAE driver configures (memattr layout, transcfg)");
+
 static void panfrost_mmu_enable(struct panfrost_device *pfdev, struct panfrost_mmu *mmu)
 {
 	int as_nr = mmu->as;
 	struct io_pgtable_cfg *cfg = &mmu->pgtbl_cfg;
 	u64 transtab = cfg->arm_mali_lpae_cfg.transtab;
 	u64 memattr = cfg->arm_mali_lpae_cfg.memattr;
+
+	/*
+	 * The vendor LPAE driver fills the attribute register with its own
+	 * index layout (impl-def cache policy / force-to-cache-all /
+	 * write-alloc / outer impl-def / outer write-alloc) and programs
+	 * AS_TRANSCFG, which this driver never touches.  Keep both selectable
+	 * so the difference can be measured on hardware.
+	 */
+	if (mali_vendor_regs) {
+		memattr = (0x8DULL << (4 * 8)) | (0x88ULL << (3 * 8)) |
+			  (0x4DULL << (2 * 8)) | (0x4FULL << (1 * 8)) |
+			  0x48ULL;
+		dev_err(pfdev->dev,
+			"DIAG vendor AS%d memattr=%08x:%08x (ours was %08x:%08x)\n",
+			as_nr, upper_32_bits(memattr), lower_32_bits(memattr),
+			mmu_read(pfdev, AS_MEMATTR_HI(as_nr)),
+			mmu_read(pfdev, AS_MEMATTR_LO(as_nr)));
+	}
 
 	mmu_hw_do_operation_locked(pfdev, as_nr, 0, ~0ULL, AS_COMMAND_FLUSH_MEM);
 
@@ -139,11 +163,31 @@ static void panfrost_mmu_enable(struct panfrost_device *pfdev, struct panfrost_m
 	mmu_write(pfdev, AS_MEMATTR_LO(as_nr), lower_32_bits(memattr));
 	mmu_write(pfdev, AS_MEMATTR_HI(as_nr), upper_32_bits(memattr));
 
+	if (mali_vendor_regs) {
+		mmu_write(pfdev, AS_TRANSCFG_LO(as_nr), 0);
+		mmu_write(pfdev, AS_TRANSCFG_HI(as_nr), 0);
+	}
+
+	dev_err(pfdev->dev,
+		"DIAG AS%d live transtab=%08x:%08x memattr=%08x:%08x transcfg=%08x:%08x\n",
+		as_nr, mmu_read(pfdev, AS_TRANSTAB_HI(as_nr)),
+		mmu_read(pfdev, AS_TRANSTAB_LO(as_nr)),
+		mmu_read(pfdev, AS_MEMATTR_HI(as_nr)),
+		mmu_read(pfdev, AS_MEMATTR_LO(as_nr)),
+		mmu_read(pfdev, AS_TRANSCFG_HI(as_nr)),
+		mmu_read(pfdev, AS_TRANSCFG_LO(as_nr)));
+
 	write_cmd(pfdev, as_nr, AS_COMMAND_UPDATE);
 }
 
 static void panfrost_mmu_disable(struct panfrost_device *pfdev, u32 as_nr)
 {
+	dev_err(pfdev->dev,
+		"DIAG mmu_disable AS%d by %pS (transtab=%08x:%08x)\n",
+		as_nr, __builtin_return_address(0),
+		mmu_read(pfdev, AS_TRANSTAB_HI(as_nr)),
+		mmu_read(pfdev, AS_TRANSTAB_LO(as_nr)));
+
 	mmu_hw_do_operation_locked(pfdev, as_nr, 0, ~0ULL, AS_COMMAND_FLUSH_MEM);
 
 	mmu_write(pfdev, AS_TRANSTAB_LO(as_nr), 0);
@@ -336,8 +380,19 @@ int panfrost_mmu_map(struct panfrost_gem_mapping *mapping)
 		prot |= IOMMU_NOEXEC;
 
 	sgt = drm_gem_shmem_get_pages_sgt(shmem);
-	if (WARN_ON(IS_ERR(sgt)))
+	if (IS_ERR(sgt)) {
+		struct iosys_map dmap;
+		int vret = drm_gem_shmem_vmap(shmem, &dmap);
+
+		dev_err(pfdev->dev,
+			"DIAG get_pages_sgt failed err=%ld size=0x%zx madv=%u purgeable=%d has_pages=%d probe_vmap=%d avail=%luKB comm=%s\n",
+			PTR_ERR(sgt), obj->size, shmem->madv,
+			drm_gem_shmem_is_purgeable(shmem), !!shmem->pages,
+			vret, si_mem_available() * 4, current->comm);
+		if (!vret)
+			drm_gem_shmem_vunmap(shmem, &dmap);
 		return PTR_ERR(sgt);
+	}
 
 	mmu_map_sg(pfdev, mapping->mmu, mapping->mmnode.start << PAGE_SHIFT,
 		   prot, sgt);
@@ -437,6 +492,65 @@ out:
 }
 
 #define NUM_FAULT_PAGES (SZ_2M / PAGE_SIZE)
+
+/*
+ * Diagnostic: the terminal fault path reports an address that must be
+ * explainable by the address space layout.  Dump what the faulting AS
+ * actually has mapped, so a fault at an address that no BO owns (0 for
+ * instance) can be traced back to whatever programmed that address.
+ */
+static void panfrost_diag_dump_as_mappings(struct panfrost_device *pfdev, int as,
+					   u64 addr)
+{
+	struct {
+		unsigned long long va;
+		unsigned long long size;
+		bool active;
+		bool heap;
+		bool noexec;
+		bool match;
+	} entries[24];
+	struct drm_mm_node *node;
+	struct panfrost_mmu *mmu;
+	u64 offset = addr >> PAGE_SHIFT;
+	unsigned int count = 0;
+	unsigned int i;
+
+	spin_lock(&pfdev->as_lock);
+	list_for_each_entry(mmu, &pfdev->as_lru_list, list) {
+		if (as != mmu->as)
+			continue;
+		spin_lock(&mmu->mm_lock);
+		drm_mm_for_each_node(node, &mmu->mm) {
+			struct panfrost_gem_mapping *mapping =
+				drm_mm_node_to_panfrost_mapping(node);
+
+			if (count >= ARRAY_SIZE(entries))
+				break;
+			entries[count].va = (unsigned long long)node->start << PAGE_SHIFT;
+			entries[count].size = (unsigned long long)node->size << PAGE_SHIFT;
+			entries[count].active = mapping->active;
+			entries[count].heap = mapping->obj->is_heap;
+			entries[count].noexec = mapping->obj->noexec;
+			entries[count].match = offset >= node->start &&
+					       offset < (node->start + node->size);
+			count++;
+		}
+		spin_unlock(&mmu->mm_lock);
+		break;
+	}
+	spin_unlock(&pfdev->as_lock);
+
+	if (!count)
+		dev_err(pfdev->dev, "DIAG AS%d: no mmu context on as_lru_list\n", as);
+
+	for (i = 0; i < count; i++)
+		dev_err(pfdev->dev,
+			"DIAG AS%d map[%u]: va=0x%llx size=0x%llx active=%d heap=%d noexec=%d match=%d\n",
+			as, i, entries[i].va, entries[i].size,
+			entries[i].active, entries[i].heap, entries[i].noexec,
+			entries[i].match);
+}
 
 static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
 				       u64 addr)
@@ -613,6 +727,29 @@ static void panfrost_drm_mm_color_adjust(const struct drm_mm_node *node,
 	}
 }
 
+static void *panfrost_mmu_alloc_low_pgtbl(void *cookie, size_t size,
+					  gfp_t gfp)
+{
+	struct panfrost_mmu *mmu = cookie;
+	struct page *page;
+
+	/*
+	 * Some platforms expose less DMA-addressable memory than system RAM.
+	 * Page-table mappings cannot be bounced because the GPU consumes their
+	 * physical addresses directly, so keep them in the DMA zone.
+	 */
+	gfp = (gfp & ~GFP_ZONEMASK) | GFP_DMA | __GFP_ZERO;
+	page = alloc_pages_node(dev_to_node(mmu->pfdev->dev), gfp,
+				get_order(size));
+
+	return page ? page_address(page) : NULL;
+}
+
+static void panfrost_mmu_free_low_pgtbl(void *cookie, void *pages, size_t size)
+{
+	__free_pages(virt_to_page(pages), get_order(size));
+}
+
 struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
 {
 	struct panfrost_mmu *mmu;
@@ -639,6 +776,10 @@ struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
 		.tlb		= &mmu_tlb_ops,
 		.iommu_dev	= pfdev->dev,
 	};
+	if (pfdev->comp->pgtbl_dma_zone) {
+		mmu->pgtbl_cfg.alloc = panfrost_mmu_alloc_low_pgtbl;
+		mmu->pgtbl_cfg.free = panfrost_mmu_free_low_pgtbl;
+	}
 
 	mmu->pgtbl_ops = alloc_io_pgtable_ops(ARM_MALI_LPAE, &mmu->pgtbl_cfg,
 					      mmu);
@@ -735,6 +876,15 @@ static irqreturn_t panfrost_mmu_irq_handler_thread(int irq, void *data)
 				exception_type, panfrost_exception_name(exception_type),
 				access_type, access_type_name(pfdev, fault_status),
 				source_id);
+
+			dev_err(pfdev->dev,
+				"DIAG unhandled fault: as=%d VA=0x%llx access=%u src=0x%x transtab=%08x:%08x memattr=%08x:%08x\n",
+				as, addr, access_type, source_id,
+				mmu_read(pfdev, AS_TRANSTAB_HI(as)),
+				mmu_read(pfdev, AS_TRANSTAB_LO(as)),
+				mmu_read(pfdev, AS_MEMATTR_HI(as)),
+				mmu_read(pfdev, AS_MEMATTR_LO(as)));
+			panfrost_diag_dump_as_mappings(pfdev, as, addr);
 
 			spin_lock(&pfdev->as_lock);
 			/* Ignore MMU interrupts on this AS until it's been

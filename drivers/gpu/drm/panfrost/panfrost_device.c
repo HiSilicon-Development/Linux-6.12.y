@@ -3,6 +3,7 @@
 /* Copyright 2019 Linaro, Ltd, Rob Herring <robh@kernel.org> */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/reset.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -384,6 +385,17 @@ const char *panfrost_exception_name(u32 exception_code)
 bool panfrost_exception_needs_reset(const struct panfrost_device *pfdev,
 				    u32 exception_code)
 {
+	/*
+	 * The CV200 Mali-T720 can report an instruction fault after a bad
+	 * imported buffer or a stale job chain.  Unlike the bus-fault workaround
+	 * above, the hardware does not recover by itself: leaving the scheduler
+	 * running simply replays the same invalid job forever.  CV200 opts into
+	 * the strict/slow reset path, so reset every GPU fault on that
+	 * integration and let the scheduler retire the failed fence.
+	 */
+	if (pfdev->comp->slow_reset && panfrost_exception_is_fault(exception_code))
+		return true;
+
 	/* If an occlusion query write causes a bus fault on affected GPUs,
 	 * future fragment jobs may hang. Reset to workaround.
 	 */
@@ -394,20 +406,49 @@ bool panfrost_exception_needs_reset(const struct panfrost_device *pfdev,
 	return false;
 }
 
-void panfrost_device_reset(struct panfrost_device *pfdev)
+int panfrost_device_reset(struct panfrost_device *pfdev)
 {
-	panfrost_gpu_soft_reset(pfdev);
+	int ret;
 
-	panfrost_gpu_power_on(pfdev);
+	ret = panfrost_gpu_soft_reset(pfdev);
+
+	if (ret && pfdev->rstc) {
+		/*
+		 * The in-GPU reset did not complete.  On this integration the
+		 * block only comes back after its SoC level reset line has been
+		 * pulsed - the vendor driver brings the GPU's reset bit down and
+		 * then up again.  Without this the first job fault leaves the
+		 * device wedged, every later submission times out and the
+		 * scheduler gives up on the queue.
+		 */
+		dev_err(pfdev->dev,
+			"gpu reset did not complete, pulsing the SoC GPU reset\n");
+		reset_control_assert(pfdev->rstc);
+		msleep(1);
+		reset_control_deassert(pfdev->rstc);
+		ret = panfrost_gpu_soft_reset(pfdev);
+	}
+
+	if (ret && pfdev->comp->slow_reset)
+		return ret;
+
+	ret = panfrost_gpu_power_on(pfdev);
+	if (ret)
+		return ret;
 	panfrost_mmu_reset(pfdev);
 	panfrost_job_enable_interrupts(pfdev);
+
+	return 0;
 }
 
 static int panfrost_device_runtime_resume(struct device *dev)
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
+	int ret;
 
-	panfrost_device_reset(pfdev);
+	ret = panfrost_device_reset(pfdev);
+	if (ret)
+		return ret;
 	panfrost_devfreq_resume(pfdev);
 
 	return 0;
@@ -424,9 +465,7 @@ static int panfrost_device_runtime_suspend(struct device *dev)
 	panfrost_job_suspend_irq(pfdev);
 	panfrost_mmu_suspend_irq(pfdev);
 	panfrost_gpu_suspend_irq(pfdev);
-	panfrost_gpu_power_off(pfdev);
-
-	return 0;
+	return panfrost_gpu_power_off(pfdev);
 }
 
 static int panfrost_device_resume(struct device *dev)

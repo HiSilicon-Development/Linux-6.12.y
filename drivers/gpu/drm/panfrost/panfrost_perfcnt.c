@@ -37,6 +37,9 @@ struct panfrost_perfcnt {
 
 void panfrost_perfcnt_clean_cache_done(struct panfrost_device *pfdev)
 {
+	if (!pfdev->perfcnt)
+		return;
+
 	complete(&pfdev->perfcnt->dump_comp);
 }
 
@@ -74,8 +77,10 @@ static int panfrost_perfcnt_enable_locked(struct panfrost_device *pfdev,
 {
 	struct panfrost_file_priv *user = file_priv->driver_priv;
 	struct panfrost_perfcnt *perfcnt = pfdev->perfcnt;
+	struct panfrost_gem_object *pbo;
+	struct drm_gem_shmem_object *shmem;
+	struct drm_gem_object *bo;
 	struct iosys_map map;
-	struct drm_gem_shmem_object *bo;
 	u32 cfg, as;
 	int ret;
 
@@ -88,25 +93,34 @@ static int panfrost_perfcnt_enable_locked(struct panfrost_device *pfdev,
 	if (ret < 0)
 		goto err_put_pm;
 
-	bo = drm_gem_shmem_create(pfdev->ddev, perfcnt->bosize);
-	if (IS_ERR(bo)) {
-		ret = PTR_ERR(bo);
-		goto err_put_pm;
+	if (pfdev->comp->needs_dma_zone) {
+		pbo = panfrost_gem_create(pfdev->ddev, perfcnt->bosize, 0);
+		if (IS_ERR(pbo)) {
+			ret = PTR_ERR(pbo);
+			goto err_put_pm;
+		}
+		bo = &pbo->base.base;
+	} else {
+		shmem = drm_gem_shmem_create(pfdev->ddev, perfcnt->bosize);
+		if (IS_ERR(shmem)) {
+			ret = PTR_ERR(shmem);
+			goto err_put_pm;
+		}
+		bo = &shmem->base;
 	}
 
 	/* Map the perfcnt buf in the address space attached to file_priv. */
-	ret = panfrost_gem_open(&bo->base, file_priv);
+	ret = panfrost_gem_open(bo, file_priv);
 	if (ret)
 		goto err_put_bo;
 
-	perfcnt->mapping = panfrost_gem_mapping_get(to_panfrost_bo(&bo->base),
-						    user);
+	perfcnt->mapping = panfrost_gem_mapping_get(to_panfrost_bo(bo), user);
 	if (!perfcnt->mapping) {
 		ret = -EINVAL;
 		goto err_close_bo;
 	}
 
-	ret = drm_gem_vmap_unlocked(&bo->base, &map);
+	ret = drm_gem_vmap_unlocked(bo, &map);
 	if (ret)
 		goto err_put_mapping;
 	perfcnt->buf = map.vaddr;
@@ -160,18 +174,18 @@ static int panfrost_perfcnt_enable_locked(struct panfrost_device *pfdev,
 		gpu_write(pfdev, GPU_PRFCNT_TILER_EN, 0xffffffff);
 
 	/* The BO ref is retained by the mapping. */
-	drm_gem_object_put(&bo->base);
+	drm_gem_object_put(bo);
 
 	return 0;
 
 err_vunmap:
-	drm_gem_vunmap_unlocked(&bo->base, &map);
+	drm_gem_vunmap_unlocked(bo, &map);
 err_put_mapping:
 	panfrost_gem_mapping_put(perfcnt->mapping);
 err_close_bo:
-	panfrost_gem_close(&bo->base, file_priv);
+	panfrost_gem_close(bo, file_priv);
 err_put_bo:
-	drm_gem_object_put(&bo->base);
+	drm_gem_object_put(bo);
 err_put_pm:
 	pm_runtime_put(pfdev->dev);
 	return ret;
@@ -215,6 +229,13 @@ int panfrost_ioctl_perfcnt_enable(struct drm_device *dev, void *data,
 	struct drm_panfrost_perfcnt_enable *req = data;
 	int ret;
 
+	/* Performance counters are optional and may be unavailable after a
+	 * partially failed probe.  Do not dereference a missing context from an
+	 * ioctl issued by a userspace stack that still exposes the render node.
+	 */
+	if (!perfcnt)
+		return -ENODEV;
+
 	ret = panfrost_unstable_ioctl_check();
 	if (ret)
 		return ret;
@@ -243,6 +264,9 @@ int panfrost_ioctl_perfcnt_dump(struct drm_device *dev, void *data,
 	void __user *user_ptr = (void __user *)(uintptr_t)req->buf_ptr;
 	int ret;
 
+	if (!perfcnt)
+		return -ENODEV;
+
 	ret = panfrost_unstable_ioctl_check();
 	if (ret)
 		return ret;
@@ -269,10 +293,23 @@ out:
 void panfrost_perfcnt_close(struct drm_file *file_priv)
 {
 	struct panfrost_file_priv *pfile = file_priv->driver_priv;
-	struct panfrost_device *pfdev = pfile->pfdev;
-	struct panfrost_perfcnt *perfcnt = pfdev->perfcnt;
+	struct panfrost_device *pfdev;
+	struct panfrost_perfcnt *perfcnt;
+	int ret;
 
-	pm_runtime_get_sync(pfdev->dev);
+	if (!pfile || !pfile->pfdev)
+		return;
+
+	pfdev = pfile->pfdev;
+	perfcnt = pfdev->perfcnt;
+	if (!perfcnt)
+		return;
+
+	ret = pm_runtime_get_sync(pfdev->dev);
+	if (ret < 0) {
+		pm_runtime_put_noidle(pfdev->dev);
+		return;
+	}
 	mutex_lock(&perfcnt->lock);
 	if (perfcnt->user == pfile)
 		panfrost_perfcnt_disable_locked(pfdev, file_priv);
