@@ -1,0 +1,4 @@
+CONFIG_LOCALVERSION="-dvbip-1001"
+CONFIG_CMDLINE="console=ttyAMA0,115200n8 earlycon=pl011,mmio32,0xf8b00000,115200n8 root=/dev/mmcblk0p14 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:4M(fastboot),4M(bootargs),12M(recovery),4M(deviceinfo),8M(baseparam),8M(pqparam),20M(logo),20M(logobak),40M(fastplay),40M(fastplaybak),40M(kernel),20M(misc),40M(preboot),-(rootfs) mem=2G loglevel=7 clk_ignore_unused fw_devlink=off dvbip.model=1001"
+CONFIG_CMDLINE_FORCE=y
+CONFIG_RC_MAP=m
