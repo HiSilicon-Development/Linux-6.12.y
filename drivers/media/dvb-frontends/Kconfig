@@ -80,6 +80,14 @@ config DVB_STV6111
 comment "Multistandard (cable + terrestrial) frontends"
 	depends on DVB_CORE
 
+config DVB_AVL6381
+	tristate "Availink AVL6381 DTMB/DVB-C demodulator"
+	depends on DVB_CORE && I2C
+	default m if !MEDIA_SUBDRV_AUTOSELECT
+	help
+	  Support for the Availink AVL6381 demodulator in DTMB and DVB-C
+	  receivers.
+
 config DVB_DRXK
 	tristate "Micronas DRXK based"
 	depends on DVB_CORE && I2C
