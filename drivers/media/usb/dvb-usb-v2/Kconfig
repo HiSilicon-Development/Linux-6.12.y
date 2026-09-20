@@ -47,6 +47,16 @@ config DVB_USB_AF9035
 	help
 	  Say Y here to support the Afatech AF9035 based DVB USB receiver.
 
+config DVB_USB_IT9303
+	tristate "ITE IT9303 AVL6381 DTMB/DVB-C USB2.0 support"
+	depends on DVB_USB_V2 && !DVB_USB_AF9035
+	select DVB_AVL6381
+	select MEDIA_TUNER_MXL603
+	help
+	  Support for ITE IT9303 USB receivers using an Availink AVL6381
+	  demodulator and MaxLinear MxL603 tuner. The generic AF9035 driver
+	  must be disabled because it claims the same 048d:9306 USB ID.
+
 config DVB_USB_ANYSEE
 	tristate "Anysee DVB-T/C USB2.0 support"
 	depends on DVB_USB_V2

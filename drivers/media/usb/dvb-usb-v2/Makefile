@@ -32,6 +32,9 @@ obj-$(CONFIG_DVB_USB_GL861) += dvb-usb-gl861.o
 dvb-usb-hd2312-objs := hd2312.o
 obj-$(CONFIG_DVB_USB_HD2312) += dvb-usb-hd2312.o
 
+dvb-usb-it9303-objs := it930x.o
+obj-$(CONFIG_DVB_USB_IT9303) += dvb-usb-it9303.o
+
 dvb-usb-mxl111sf-objs += mxl111sf.o mxl111sf-phy.o mxl111sf-i2c.o
 dvb-usb-mxl111sf-objs += mxl111sf-gpio.o
 obj-$(CONFIG_DVB_USB_MXL111SF) += dvb-usb-mxl111sf.o
