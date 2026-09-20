@@ -57,6 +57,12 @@ config DVB_USB_IT9303
 	  demodulator and MaxLinear MxL603 tuner. The generic AF9035 driver
 	  must be disabled because it claims the same 048d:9306 USB ID.
 
+config DVB_USB_ICAST
+	tristate "SMIT iCast DTMB/DVB-C USB2.0 support"
+	depends on DVB_USB_V2
+	help
+	  Say Y here to support the SMIT iCast DTMB/DVB-C USB receiver.
+
 config DVB_USB_ANYSEE
 	tristate "Anysee DVB-T/C USB2.0 support"
 	depends on DVB_USB_V2
